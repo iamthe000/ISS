@@ -300,6 +300,13 @@
 </div>
 
 <script>
+const UNIT_TYPES = {
+    infantry: { name: "歩兵", atk: 1.0, def: 1.0, icon: "🛡️", desc: "標準的な部隊。攻守のバランスが良い。" },
+    cavalry: { name: "騎兵", atk: 1.2, def: 0.8, icon: "🐎", desc: "攻撃に優れ、弓兵に強いが槍兵に弱い。", bonusAgainst: "archers" },
+    spearmen: { name: "槍兵", atk: 0.9, def: 1.1, icon: "🔱", desc: "防御に優れ、騎兵に強いが弓兵に弱い。", bonusAgainst: "cavalry" },
+    archers: { name: "弓兵", atk: 1.1, def: 0.7, icon: "🏹", desc: "遠距離攻撃が得意で、槍兵に強いが騎兵に弱い。", bonusAgainst: "spearmen" }
+};
+
 const CONFIG = {
     TILE_SIZE: 16,
     SEA_ID: 0,
@@ -385,12 +392,15 @@ class GameEngine {
                 const isLand = ownerId !== CONFIG.SEA_ID;
                 const baseIc = isLand ? Math.floor(Math.random() * 3) + 1 : 0;
                 const baseMp = isLand ? Math.floor(Math.random() * 50) + 10 : 0;
-                const units = isLand && Math.random() < 0.1 ? 1 : 0;
+                const unitCount = isLand && Math.random() < 0.1 ? 1 : 0;
+                
+                // unitsをオブジェクトに変更。初期化時はすべて歩兵とする
+                const units = { infantry: unitCount, cavalry: 0, spearmen: 0, archers: 0 };
 
                 row.push({ x, y, owner: ownerId, baseIc, baseMp, units, fort: 0 });
 
-                if (isLand && units > 0) {
-                    this.countries[ownerId].totalDivisions += units;
+                if (isLand && unitCount > 0) {
+                    this.countries[ownerId].totalDivisions += unitCount;
                 }
             }
             this.tiles.push(row);
@@ -398,6 +408,11 @@ class GameEngine {
 
         ui.buildSetupScreen(this.countries);
         ui.log("システム", "マップをロード完了。", "text-green");
+    }
+
+    getTotalUnits(tile) {
+        if (!tile || !tile.units) return 0;
+        return Object.values(tile.units).reduce((a, b) => a + b, 0);
     }
 
     initCountry(id, name, color) {
@@ -512,6 +527,7 @@ class GameEngine {
         this.player.armies.push({
             name: `第${armyId}軍団`,
             reserveDivisions: 0, 
+            unitType: 'infantry',
             frontline: new Set(),
             targetline: new Set(),
             targetCountryId: null,
@@ -592,8 +608,8 @@ class GameEngine {
                 }).filter(t => t.owner === this.player.id);
                 
                 if (frontTiles.length > 0) {
-                    frontTiles.sort((a,b) => a.units - b.units);
-                    frontTiles[0].units++;
+                    frontTiles.sort((a,b) => this.getTotalUnits(a) - this.getTotalUnits(b));
+                    frontTiles[0].units[army.unitType || 'infantry']++;
                     army.reserveDivisions--;
                     ui.updateArmyPanel();
                 }
@@ -620,7 +636,7 @@ class GameEngine {
             const [fx, fy] = coordStr.split(',').map(Number);
             const fromTile = this.tiles[fy][fx];
             
-            if (fromTile.owner !== attackerObj.id || fromTile.units <= 0) return;
+            if (fromTile.owner !== attackerObj.id || this.getTotalUnits(fromTile) <= 0) return;
 
             let neighbors = this.getNeighbors(fx, fy).filter(n => n.owner !== CONFIG.SEA_ID && n.owner !== attackerObj.id);
             let isLanding = false;
@@ -669,8 +685,8 @@ class GameEngine {
                     }
                 }
                 if (borderTiles.length > 0) {
-                    borderTiles.sort((a,b) => a.units - b.units);
-                    borderTiles[0].units++;
+                    borderTiles.sort((a,b) => this.getTotalUnits(a) - this.getTotalUnits(b));
+                    borderTiles[0].units.infantry++;
                     ai.reserveDivisions--;
                 }
             }
@@ -679,7 +695,7 @@ class GameEngine {
             for (let y = 0; y < this.mapMeta.height; y++) {
                 for (let x = 0; x < this.mapMeta.width; x++) {
                     const t = this.tiles[y][x];
-                    if (t.owner === ai.id && t.units > 0) borderUnits.push(t);
+                    if (t.owner === ai.id && this.getTotalUnits(t) > 0) borderUnits.push(t);
                 }
             }
 
@@ -703,22 +719,56 @@ class GameEngine {
         return minDist;
     }
 
+    calculatePower(tile, isAttacker, techMods, opponentUnits = null) {
+        let power = 0;
+        for (const type in tile.units) {
+            const count = tile.units[type];
+            if (count <= 0) continue;
+
+            const basePower = isAttacker ? UNIT_TYPES[type].atk : UNIT_TYPES[type].def;
+            let typePower = count * basePower * 3;
+
+            // 相性ボーナス
+            if (opponentUnits) {
+                const bonusTarget = UNIT_TYPES[type].bonusAgainst;
+                if (bonusTarget && opponentUnits[bonusTarget] > 0) {
+                    // 敵軍に得意な兵種がいれば、その割合に応じてボーナス（最大+50%）
+                    const opponentTotal = Object.values(opponentUnits).reduce((a, b) => a + b, 0);
+                    if (opponentTotal > 0) {
+                        const ratio = opponentUnits[bonusTarget] / opponentTotal;
+                        typePower *= (1.0 + 0.5 * ratio);
+                    }
+                }
+            }
+            power += typePower;
+        }
+
+        const mult = isAttacker ? (techMods.atk_mult || 1.0) : (techMods.def_mult || 1.0);
+        return (Math.random() * 5 + power) * mult;
+    }
+
     resolveCombat(fromTile, toTile, attacker, defender, armyObj = null, isLanding = false) {
-        let atkScore = (Math.random() * 5 + fromTile.units * 3) * attacker.techMods.atk_mult;
+        let atkScore = this.calculatePower(fromTile, true, attacker.techMods, toTile.units);
         if (isLanding) atkScore *= attacker.techMods.landing_atk_mult;
         
-        const defScore = (Math.random() * 5 + toTile.units * 3 + toTile.fort * 2) * (defender ? defender.techMods.def_mult : 1.0);
+        const defScore = this.calculatePower(toTile, false, defender ? defender.techMods : { def_mult: 1.0 }, fromTile.units) + (toTile.fort * 2);
 
         if (atkScore > defScore) {
-            const movingUnits = Math.max(1, Math.ceil(fromTile.units / 2));
-            fromTile.units -= movingUnits;
+            // 全兵種を比例的に移動
+            const fromTotal = this.getTotalUnits(fromTile);
+            const moveRatio = 0.5;
             
-            if (toTile.units > 0 && defender) {
-                defender.totalDivisions = Math.max(0, defender.totalDivisions - toTile.units);
+            if (toTile.units && defender) {
+                const toTotal = this.getTotalUnits(toTile);
+                defender.totalDivisions = Math.max(0, defender.totalDivisions - toTotal);
             }
             
             toTile.owner = attacker.id;
-            toTile.units = movingUnits;
+            for (const type in fromTile.units) {
+                const moving = Math.ceil(fromTile.units[type] * moveRatio);
+                fromTile.units[type] -= moving;
+                toTile.units[type] = moving;
+            }
 
             if (armyObj) {
                 armyObj.frontline.add(`${toTile.x},${toTile.y}`);
@@ -729,8 +779,13 @@ class GameEngine {
                 }
             }
         } else {
-            if (Math.random() < 0.2 && fromTile.units > 1) {
-                fromTile.units--;
+            // 全兵種を比例的に損失
+            const fromTotal = this.getTotalUnits(fromTile);
+            if (Math.random() < 0.2 && fromTotal > 1) {
+                // ランダムに1つ損失
+                const types = Object.keys(fromTile.units).filter(t => fromTile.units[t] > 0);
+                const lostType = types[Math.floor(Math.random() * types.length)];
+                fromTile.units[lostType]--;
                 attacker.totalDivisions = Math.max(0, attacker.totalDivisions - 1);
             }
         }
@@ -758,7 +813,7 @@ class GameEngine {
 
                 if (hasEnemy || canLaunchLanding) {
                     newFrontline.add(coordStr);
-                } else if (tile.units > 0) {
+                } else if (this.getTotalUnits(tile) > 0) {
                     this.moveUnitsToNearestFront(tile, army, ownerId);
                 }
             }
@@ -768,7 +823,7 @@ class GameEngine {
     }
 
     moveUnitsToNearestFront(tile, army, ownerId) {
-        if (tile.units <= 0) return;
+        if (this.getTotalUnits(tile) <= 0) return;
         
         const borderTiles = [];
         for(let y=0; y<this.mapMeta.height; y++){
@@ -783,9 +838,11 @@ class GameEngine {
         
         if (borderTiles.length > 0) {
             borderTiles.sort((a,b) => Math.hypot(a.x - tile.x, a.y - tile.y) - Math.hypot(b.x - tile.x, b.y - tile.y));
-            borderTiles[0].units += tile.units;
+            for (const type in tile.units) {
+                borderTiles[0].units[type] += tile.units[type];
+                tile.units[type] = 0;
+            }
             army.frontline.add(`${borderTiles[0].x},${borderTiles[0].y}`); 
-            tile.units = 0;
         }
     }
 
@@ -995,7 +1052,17 @@ const ui = {
             document.getElementById('ti-owner').style.color = tile.owner === CONFIG.SEA_ID ? "#00bcd4" : (ownerObj ? ownerObj.color : "#fff");
             document.getElementById('ti-ic').innerText = tile.baseIc;
             document.getElementById('ti-manpower').innerText = tile.baseMp;
-            document.getElementById('ti-units').innerText = tile.units > 0 ? `${tile.units} 個` : "なし";
+            
+            const totalUnits = game.getTotalUnits(tile);
+            let unitsText = totalUnits > 0 ? `${totalUnits} 個` : "なし";
+            if (totalUnits > 0) {
+                const breakdown = Object.entries(tile.units)
+                    .filter(([type, count]) => count > 0)
+                    .map(([type, count]) => `${UNIT_TYPES[type].icon}${count}`)
+                    .join(' ');
+                unitsText += ` (${breakdown})`;
+            }
+            document.getElementById('ti-units').innerText = unitsText;
 
             if (this.drawingMode === 'frontline') {
                 this.canvas.style.cursor = tile.owner === game.player.id ? 'cell' : 'not-allowed';
@@ -1066,14 +1133,15 @@ const ui = {
                 this.ctx.fillStyle = cObj ? cObj.color : '#555';
                 this.ctx.fillRect(x * ts, y * ts, ts, ts);
 
-                if (tile.units > 0) {
+                const totalUnits = game.getTotalUnits(tile);
+                if (totalUnits > 0) {
                     this.ctx.fillStyle = tile.owner === game.player?.id ? '#4caf50' : '#f44336';
                     this.ctx.fillRect(x * ts + 2, y * ts + 2, ts - 4, ts - 4);
                     this.ctx.fillStyle = '#fff';
                     this.ctx.font = "10px sans-serif";
                     this.ctx.textAlign = "center";
                     this.ctx.textBaseline = "middle";
-                    this.ctx.fillText(tile.units, x * ts + ts / 2, y * ts + ts / 2);
+                    this.ctx.fillText(totalUnits, x * ts + ts / 2, y * ts + ts / 2);
                 }
             }
         }
@@ -1174,12 +1242,21 @@ const ui = {
             army.frontline.forEach(c => {
                 const [x,y] = c.split(',').map(Number);
                 if (game.tiles[y] && game.tiles[y][x] && game.tiles[y][x].owner === game.player.id) {
-                    frontUnits += game.tiles[y][x].units;
+                    frontUnits += game.getTotalUnits(game.tiles[y][x]);
                 }
             });
 
             const isFrontlineActive = this.drawingMode === 'frontline' && this.activeArmyIndex === index;
             const isTargetlineActive = this.drawingMode === 'targetline' && this.activeArmyIndex === index;
+
+            // 兵種選択肢の生成
+            let typeOptions = '';
+            for (const type in UNIT_TYPES) {
+                const selected = army.unitType === type ? 'selected' : '';
+                typeOptions += `<option value="${type}" ${selected}>${UNIT_TYPES[type].icon} ${UNIT_TYPES[type].name}</option>`;
+            }
+
+            const currentUnit = UNIT_TYPES[army.unitType || 'infantry'];
 
             div.innerHTML = `
                 <div class="army-header">
@@ -1190,6 +1267,18 @@ const ui = {
                     </div>
                 </div>
                 
+                <div style="margin-bottom: 8px; display: flex; align-items: center; gap: 8px;">
+                    <span style="font-size: 0.8em; color: var(--text-muted);">兵種:</span>
+                    <select onchange="game.player.armies[${index}].unitType = this.value; ui.updateArmyPanel();" 
+                            style="background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 2px 5px; flex: 1; font-size: 0.9em;">
+                        ${typeOptions}
+                    </select>
+                </div>
+                <div style="font-size: 0.75em; color: var(--text-muted); margin-bottom: 10px; background: rgba(0,0,0,0.2); padding: 5px; border-radius: 4px;">
+                    ${currentUnit.desc} <br>
+                    <span class="text-blue">攻: ${currentUnit.atk}</span> | <span class="text-green">守: ${currentUnit.def}</span>
+                </div>
+
                 <div class="army-stats-row">
                     <div>展開: <span class="text-green" style="font-weight:bold;">${frontUnits}</span> | 待機: <span class="text-gold" style="font-weight:bold;">${army.reserveDivisions}</span></div>
                     <button class="primary" style="padding: 3px 12px; font-weight:bold;" onclick="game.assignDivisionToArmy(${index})">＋ 補充</button>
